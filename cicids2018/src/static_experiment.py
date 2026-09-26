@@ -1,4 +1,6 @@
 import os
+import sys
+from pathlib import Path
 import pandas as pd
 import numpy as np
 import torch
@@ -8,7 +10,6 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 from tqdm import tqdm
-import torch.amp as amp
 
 # Optional: Intel scikit-learn acceleration (Turbo mode for RF)
 try:
@@ -18,16 +19,26 @@ try:
 except ImportError:
     pass
 
+
+def get_device():
+    """Selects Intel Arc (xpu), CUDA, or CPU fallback."""
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu")
+    elif torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 # =====================================================================
 # STEP 1: ALIGNED STATIC CONTROL GROUP DATA TENSORS
 # =====================================================================
 
 def prepare_static_data(project_folder):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
 
     print("\n" + "="*80)
     print(f"STEP 1: COMPILING STATIC CONTROL GROUP TENSORS")
-    print(f"Hardware Target: {device}")
+    print(f"Hardware Target: {device} ({torch.xpu.get_device_name(0) if device.type == 'xpu' else 'CPU/CUDA'})")
     print("="*80)
 
     # Reconstruct Global Scaling Bounds
@@ -55,7 +66,7 @@ def prepare_static_data(project_folder):
     X_train_raw = df_train[global_feature_cols]
     y_train_static = np.where(df_train['Label'] == 'Benign', 0, 1).astype(np.int32)
     
-    # Optimization: Cast to float32 to prevent hidden memory copying during training
+    # Cast to float32 to prevent hidden memory copying during training
     X_train_static = static_scaler.transform(X_train_raw).astype(np.float32)
 
     # Ingest Future Deployment Test Days
@@ -89,7 +100,6 @@ def train_rf_static(X_train_static, y_train_static, test_days_tensors, static_me
     print("STEP 2: TRAINING PILLAR 1 - RANDOM FOREST CONTROL ENSEMBLE")
     print("="*80)
 
-    # Optimization: max_depth=25 speeds up training and limits overfitting
     rf_model = RandomForestClassifier(n_estimators=0, max_depth=25, warm_start=True, random_state=42, n_jobs=-1)
 
     total_trees = 100
@@ -146,7 +156,6 @@ class Static1DCNN(nn.Module):
             nn.MaxPool1d(2)
         )
         
-        # FIX: Dynamically compute the flatten size using a dummy tensor
         with torch.no_grad():
             dummy_input = torch.zeros(1, 1, input_dim)
             dummy_output = self.conv(dummy_input)
@@ -196,8 +205,8 @@ def train_dl_model(model, model_name, train_loader, test_days_tensors, static_me
             batch_X, batch_y = batch_X.to(device), batch_y.to(device)
             optimizer.zero_grad()
             
-            # Optimization: Mixed Precision Training (autocast)
-            with amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+            # Autocast matched dynamically to Intel Arc (xpu), CUDA, or CPU
+            with torch.autocast(device_type=device.type, enabled=(device.type in ["cuda", "xpu"])):
                 outputs = model(batch_X)
                 loss = criterion(outputs, batch_y)
                 
@@ -208,20 +217,18 @@ def train_dl_model(model, model_name, train_loader, test_days_tensors, static_me
             epoch_loss += current_loss
             batch_bar.set_postfix(batch_loss=f"{current_loss:.4f}")
 
-    # FIX: Optimized Batched Evaluation to prevent OOM
     model.eval()
     print(f"\nDeploying {model_name} against future timelines...")
     with torch.no_grad():
         for day_name, (X_test, y_test) in test_days_tensors.items():
-            t_X_test = torch.tensor(X_test, dtype=torch.float32) # Kept on CPU initially
+            t_X_test = torch.tensor(X_test, dtype=torch.float32)
             all_preds = []
             eval_batch_size = 4096 
             
             for i in range(0, len(t_X_test), eval_batch_size):
                 batch_ev = t_X_test[i : i + eval_batch_size].to(device)
                 
-                # Optimization: Mixed precision inference
-                with amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+                with torch.autocast(device_type=device.type, enabled=(device.type in ["cuda", "xpu"])):
                     logits = model(batch_ev)
                     
                 probs = torch.sigmoid(logits).cpu().numpy()
@@ -253,15 +260,15 @@ def run_static_experiment(project_folder):
     # Train Random Forest
     train_rf_static(X_train_static, y_train_static, test_days_tensors, static_metrics_master)
 
-    # Prepare PyTorch DataLoader with optimizations (larger batch, pinning memory)
+    # PyTorch DataLoader on Windows: num_workers=0 avoids multi-threading spawn overhead
     t_X_train = torch.tensor(X_train_static, dtype=torch.float32)
     t_y_train = torch.tensor(y_train_static, dtype=torch.float32).unsqueeze(1)
     train_loader = DataLoader(
         TensorDataset(t_X_train, t_y_train), 
         batch_size=2048, 
         shuffle=True, 
-        num_workers=2, 
-        pin_memory=True
+        num_workers=0, 
+        pin_memory=False
     )
 
     # Initialize PyTorch Models
@@ -271,15 +278,6 @@ def run_static_experiment(project_folder):
     cnn_model = Static1DCNN(input_dim).to(device)
     lstm_model = StaticLSTM(input_dim).to(device)
 
-    # FIX: Fail-safe PyTorch 2.0 Compiler
-    if int(torch.__version__.split('.')[0]) >= 2:
-        try:
-            mlp_model = torch.compile(mlp_model)
-            cnn_model = torch.compile(cnn_model)
-            lstm_model = torch.compile(lstm_model)
-        except Exception as e:
-            print(f"\n[Notice] torch.compile skipped due to environment incompatibility: {e}\n")
-
     # Train Deep Learning Models
     train_dl_model(mlp_model, "MLP_Static", train_loader, test_days_tensors, static_metrics_master, device)
     train_dl_model(cnn_model, "1D-CNN_Static", train_loader, test_days_tensors, static_metrics_master, device)
@@ -287,7 +285,7 @@ def run_static_experiment(project_folder):
 
     # Export Metrics
     print("\n" + "="*80)
-    print("STEP 4: METRICS CONSOLIDATION & PERSISTENT DRIVE EXPORT")
+    print("STEP 4: METRICS CONSOLIDATION & PERSISTENT LOCAL EXPORT")
     print("="*80)
     
     output_results_path = os.path.join(project_folder, "static_performance_results.csv")
@@ -296,4 +294,14 @@ def run_static_experiment(project_folder):
     
     print(f"\nSUCCESS! Static Group Master Performance File written to:\n{output_results_path}")
     print("\nAGGREGATED PERFORMANCE MATRIX OVERVIEW (STATIC BENCHMARK CONTROL GROUP):")
-    print(df_static_performance.to_markdown(index=False))
+    try:
+        print(df_static_performance.to_markdown(index=False))
+    except Exception:
+        print(df_static_performance.to_string(index=False))
+
+
+if __name__ == "__main__":
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    data_dir = str(PROJECT_ROOT / "data")
+    
+    run_static_experiment(project_folder=data_dir)

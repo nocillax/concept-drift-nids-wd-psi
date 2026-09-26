@@ -1,5 +1,7 @@
 import os
+import sys
 import joblib
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -30,7 +32,7 @@ class WGAN_Generator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
 
             nn.Linear(256, output_dim),
-            nn.Sigmoid()  # Outputs bounded in [0, 1] matching MinMaxScaler range
+            nn.Sigmoid()
         )
 
     def forward(self, z):
@@ -51,7 +53,7 @@ class WGAN_Critic(nn.Module):
             nn.Linear(128, 64),
             nn.LeakyReLU(0.2, inplace=True),
 
-            nn.Linear(64, 1)  # Unconstrained score output
+            nn.Linear(64, 1)
         )
 
     def forward(self, x):
@@ -80,32 +82,29 @@ def calculate_gradient_penalty(critic, real_samples, fake_samples, device):
     return ((gradient_norm - 1) ** 2).mean() * LAMBDA_GP
 
 
+def get_device():
+    """Selects Intel Arc (xpu), CUDA, or CPU fallback."""
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu")
+    elif torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 def balance_dataset_day(
     target_day: str, 
     project_folder: str, 
     target_count: int = 100000, 
-    epochs: int = 500,
+    epochs: int = 500, 
     n_critic: int = 5
 ) -> None:
-    """
-    Balances a specific dataset day (downsamples majority classes to target_count
-    and trains class-wise WGAN-GPs to generate synthetic samples for minority classes).
-    
-    Args:
-        target_day: Target day key (e.g., 'feb14', 'feb28', mar02).
-        project_folder: Path to persistent Google Drive folder.
-        target_count: Target uniform sample limit per class (default: 100k).
-        epochs: WGAN-GP training iterations (default: 500).
-        n_critic: Number of critic updates per generator update (default: 5).
-    """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     clean_raw_path = os.path.join(project_folder, f"{target_day}_raw_clean.csv")
     balanced_out_path = os.path.join(project_folder, f"{target_day}_balanced.csv")
     
     scaler_path = os.path.join(project_folder, "global_scaler.pkl")
     features_path = os.path.join(project_folder, "global_feature_columns.pkl")
 
-    # Load fitted global baseline scaler and feature column order
     if not (os.path.exists(scaler_path) and os.path.exists(features_path)):
         raise FileNotFoundError("Master scaler or feature column map not found! Run baseline preprocessing first.")
     
@@ -119,7 +118,7 @@ def balance_dataset_day(
 
     print("=" * 80)
     print(f"RUNNING GENERATIVE BALANCING ENGINE FOR TARGET DAY: {target_day.upper()}")
-    print(f"Hardware Device: {device}")
+    print(f"Hardware Device: {device} ({torch.xpu.get_device_name(0) if device.type == 'xpu' else 'CPU/CUDA'})")
     print(f"Reading Clean Source: {clean_raw_path}")
     print("=" * 80)
 
@@ -131,8 +130,10 @@ def balance_dataset_day(
     print("\nInitial Class Distribution Matrix:")
     print(class_counts)
 
-    # Transform features into [0,1] space using saved global baseline scaler
-    X_day_scaled = pd.DataFrame(global_scaler.transform(X_day_raw), columns=global_feature_columns)
+    X_day_scaled = global_scaler.transform(X_day_raw)
+    X_day_scaled = np.clip(X_day_scaled, 0.0, 1.0)
+    X_day_scaled = pd.DataFrame(X_day_scaled, columns=global_feature_columns)
+    
     df_working = X_day_scaled.copy()
     df_working['Label'] = y_day_raw
 
@@ -142,12 +143,9 @@ def balance_dataset_day(
         print(f"\nProcessing class footprint for: [{label}]")
         df_class = df_working[df_working['Label'] == label]
 
-        # Scenario A: Over-abundant class -> Strict downsampling
         if count >= target_count:
             print(f"-> Class [{label}] meets target limit ({count} rows). Downsampling to {target_count}...")
             balanced_class_dfs.append(df_class.sample(n=target_count, random_state=42))
-
-        # Scenario B: Starved minority class -> Train WGAN-GP synthetic generator
         else:
             needed_rows = target_count - count
             print(f"-> Class [{label}] is starved ({count} rows). Training WGAN-GP layer for {needed_rows} rows...")
@@ -172,13 +170,13 @@ def balance_dataset_day(
             gen_net.train()
             crit_net.train()
 
-            epoch_pbar = tqdm(range(epochs), desc=f"Optimizing {label[:15]} Landscape")
+            epoch_pbar = tqdm(range(epochs), desc=f"Optimizing {str(label)[:15]} Landscape")
 
             for epoch in epoch_pbar:
                 for i, (real_samples,) in enumerate(loader):
                     real_samples = real_samples.to(device)
 
-                    # === Train Critic Matrix ===
+                    # Train Critic
                     optimizer_C.zero_grad()
                     noise = torch.randn(real_samples.size(0), LATENT_DIM, device=device)
                     fake_samples = gen_net(noise).detach()
@@ -188,7 +186,7 @@ def balance_dataset_day(
                     (loss_C + gp).backward()
                     optimizer_C.step()
 
-                    # === Train Generator Matrix every n_critic batches (Corrected Batch Index Check) ===
+                    # Train Generator
                     if i % n_critic == 0:
                         optimizer_G.zero_grad()
                         gen_samples = gen_net(torch.randn(real_samples.size(0), LATENT_DIM, device=device))
@@ -196,13 +194,21 @@ def balance_dataset_day(
                         loss_G.backward()
                         optimizer_G.step()
 
-            # Mint synthetic feature arrays
+            # Fast chunked synthesis
             gen_net.eval()
+            synthetic_chunks = []
+            chunk_size = 32768
+            
             with torch.no_grad():
-                noise = torch.randn(needed_rows, LATENT_DIM, device=device)
-                generated_features = gen_net(noise).cpu().numpy()
+                remaining = needed_rows
+                while remaining > 0:
+                    current_chunk = min(remaining, chunk_size)
+                    noise = torch.randn(current_chunk, LATENT_DIM, device=device)
+                    chunk_out = gen_net(noise).cpu().numpy()
+                    synthetic_chunks.append(chunk_out)
+                    remaining -= current_chunk
 
-            # Enforce strict [0.0, 1.0] MinMaxScaler bounds
+            generated_features = np.vstack(synthetic_chunks)
             generated_features = np.clip(generated_features, 0.0, 1.0)
 
             df_synthetic = pd.DataFrame(generated_features, columns=global_feature_columns)
@@ -211,7 +217,6 @@ def balance_dataset_day(
             df_balanced_class = pd.concat([df_class, df_synthetic], axis=0, ignore_index=True)
             balanced_class_dfs.append(df_balanced_class)
 
-    # Inverse scale back to raw metric feature bounds
     df_day_balanced_scaled = pd.concat(balanced_class_dfs, axis=0, ignore_index=True)
     X_balanced_scaled = df_day_balanced_scaled[global_feature_columns]
     y_balanced_final = df_day_balanced_scaled['Label'].values
@@ -224,7 +229,23 @@ def balance_dataset_day(
     df_final_balanced.to_csv(balanced_out_path, index=False)
 
     print("\n" + "=" * 80)
-    print(f"SUCCESS! Balanced file committed to Drive: {balanced_out_path}")
+    print(f"SUCCESS! Balanced file committed to: {balanced_out_path}")
     print("=" * 80)
-    print(f"Verified Class Distribution Matrix for {target_day.upper()}:")
-    print(df_final_balanced['Label'].value_counts())
+
+
+if __name__ == "__main__":
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    data_dir = str(PROJECT_ROOT / "data")
+    
+    # If a day argument is passed (e.g. python -m cicids2018.src.wgan_balancer feb14)
+    if len(sys.argv) > 1:
+        target_day = sys.argv[1].lower()
+        balance_dataset_day(target_day=target_day, project_folder=data_dir)
+    else:
+        # Fallback list if no argument is provided
+        DAYS_TO_BALANCE = [
+            "feb14", "feb15", "feb16", "feb20", "feb21", 
+            "feb22", "feb23", "feb28", "mar01", "mar02"
+        ]
+        for day in DAYS_TO_BALANCE:
+            balance_dataset_day(target_day=day, project_folder=data_dir)

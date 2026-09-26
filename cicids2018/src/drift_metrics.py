@@ -1,5 +1,6 @@
 import os
 import joblib
+from pathlib import Path
 import pandas as pd
 import numpy as np
 from scipy.stats import wasserstein_distance
@@ -146,7 +147,16 @@ def run_static_drift_analysis(project_folder: str) -> pd.DataFrame:
     df_final_drift.to_csv(output_csv_path, index=False)
 
     print("\n" + "=" * 80)
-    print(f"SUCCESS! Static drift metrics committed to Drive: {output_csv_path}")
+    print(f"SUCCESS! Static drift metrics saved to: {output_csv_path}")
     print("=" * 80)
 
     return df_final_drift
+
+
+if __name__ == "__main__":
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    data_dir = str(PROJECT_ROOT / "data")
+    
+    df_drift = run_static_drift_analysis(project_folder=data_dir)
+    print("\nCalculated Static Drift Metrics Summary:")
+    print(df_drift.to_string(index=False))

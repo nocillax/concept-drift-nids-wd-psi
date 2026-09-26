@@ -1,5 +1,6 @@
 import os
 import joblib
+from pathlib import Path
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 
@@ -18,6 +19,11 @@ def setup_baseline_preprocessing(project_folder: str):
         if os.path.exists(file_path):
             print(f"-> Loading records from: {file_path}")
             baseline_dfs.append(pd.read_csv(file_path))
+        else:
+            print(f"[Warning] File not found: {file_path}")
+
+    if not baseline_dfs:
+        raise FileNotFoundError(f"No baseline data files found in {project_folder}")
 
     df_baseline_raw = pd.concat(baseline_dfs, axis=0, ignore_index=True)
 
@@ -28,7 +34,7 @@ def setup_baseline_preprocessing(project_folder: str):
     global_scaler = MinMaxScaler()
     global_scaler.fit(X_baseline_raw[global_feature_columns])
 
-    # Save fitted transformers to Drive
+    # Save fitted transformers to data directory
     scaler_path = os.path.join(project_folder, "global_scaler.pkl")
     features_path = os.path.join(project_folder, "global_feature_columns.pkl")
     
@@ -40,3 +46,9 @@ def setup_baseline_preprocessing(project_folder: str):
     print(f"Retained global features count: {len(global_feature_columns)}")
 
     return global_scaler, global_feature_columns
+
+if __name__ == "__main__":
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    data_dir = str(PROJECT_ROOT / "data")
+    
+    setup_baseline_preprocessing(project_folder=data_dir)

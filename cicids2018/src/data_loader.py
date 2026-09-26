@@ -1,6 +1,7 @@
 import os
 import gc
 import subprocess
+from pathlib import Path
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
@@ -47,9 +48,12 @@ def fetch_and_clean_day(
     chunksize: int = 100000, 
     sample_frac: float = 0.30
 ) -> None:
+    os.makedirs(output_dir, exist_ok=True)
     raw_output_path = os.path.join(output_dir, f"{day_key}_raw.csv")
     clean_output_path = os.path.join(output_dir, f"{day_key}_raw_clean.csv")
-    temp_local_file = f"/content/temp_{day_key}.csv"
+    
+    # Store temp files in the output directory instead of /content/
+    temp_local_file = os.path.join(output_dir, f"temp_{day_key}.csv")
 
     # Step A: Download & Sample Raw Data if not present
     if not os.path.exists(raw_output_path):
@@ -99,7 +103,6 @@ def fetch_and_clean_day(
 
 
 def run_full_data_pipeline(project_folder: str) -> None:
-    subprocess.run("pip install awscli --quiet", shell=True)
     for day_key, file_name in DATASET_S3_FILES.items():
         frac = 0.15 if day_key == "feb20" else 0.30
         fetch_and_clean_day(
@@ -109,3 +112,11 @@ def run_full_data_pipeline(project_folder: str) -> None:
             target_rows=200000,
             sample_frac=frac
         )
+
+if __name__ == "__main__":
+    # Automatically resolves the root project directory
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    data_output_dir = str(PROJECT_ROOT / "data")
+    
+    print(f"Starting data pipeline. Output directory: {data_output_dir}")
+    run_full_data_pipeline(project_folder=data_output_dir)
