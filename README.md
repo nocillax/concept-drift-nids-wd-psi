@@ -8,6 +8,7 @@ The pipeline implements raw data fetching, feature scaling, minority class balan
 
 The repository is divided into two independent pipelines for the respective datasets.
 
+```text
 concept-drift-nids-wd-psi-main/
 ├── cicids2018/
 │   ├── data/                 # Generated datasets, scalers, and results (ignored in git)
@@ -18,6 +19,7 @@ concept-drift-nids-wd-psi-main/
 │   └── src/                  # Core pipeline scripts for UNSW-NB15
 ├── requirements.txt
 └── test_xpu.py               # Utility to check Intel Arc/CUDA hardware acceleration
+```
 
 
 ## Setup Instructions
