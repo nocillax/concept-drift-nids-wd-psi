@@ -11,10 +11,10 @@ The repository is divided into two independent pipelines for the respective data
 ```text
 concept-drift-nids-wd-psi/
 ├── cicids2018/
-│   ├── data/                 # Generated datasets, scalers, and results (ignored in git)
+│   ├── data/                 # Generated datasets, scalers, and results
 │   └── src/                  # Core pipeline scripts for CIC-IDS2018
 ├── unswnb15/
-│   ├── data/                 # Generated datasets, scalers, and results (ignored in git)
+│   ├── data/                 # Generated datasets, scalers, and results
 │   ├── raw_csvs/             # Placement folder for raw UNSW-NB15 block files
 │   └── src/                  # Core pipeline scripts for UNSW-NB15
 ├── requirements.txt
