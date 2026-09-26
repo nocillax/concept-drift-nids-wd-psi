@@ -9,7 +9,7 @@ The pipeline implements raw data fetching, feature scaling, minority class balan
 The repository is divided into two independent pipelines for the respective datasets.
 
 ```text
-concept-drift-nids-wd-psi-main/
+concept-drift-nids-wd-psi/
 ├── cicids2018/
 │   ├── data/                 # Generated datasets, scalers, and results (ignored in git)
 │   └── src/                  # Core pipeline scripts for CIC-IDS2018
